@@ -11,6 +11,7 @@ import (
 type nullChunkSeed struct {
 	id         ChunkID
 	blockfile  *os.File
+	blockLen   uint64
 	canReflink bool
 }
 
@@ -19,11 +20,17 @@ func newNullChunkSeed(dstFile string, blocksize uint64, max uint64) (*nullChunkS
 	if err != nil {
 		return nil, err
 	}
-	var canReflink bool
+	var (
+		canReflink bool
+		blockLen   uint64
+	)
 	if CanClone(dstFile, blockfile.Name()) {
 		canReflink = true
-		b := make([]byte, blocksize)
-		if _, err := blockfile.Write(b); err != nil {
+		// Make the file of zeros as large as the largest chunk, rounded up to
+		// full blocks, so a run of zeros is cloned in few large pieces rather
+		// than one block at a time.
+		blockLen = (max + blocksize - 1) / blocksize * blocksize
+		if _, err := blockfile.Write(make([]byte, blockLen)); err != nil {
 			return nil, err
 		}
 	}
@@ -31,6 +38,7 @@ func newNullChunkSeed(dstFile string, blocksize uint64, max uint64) (*nullChunkS
 		id:         NewNullChunk(max).ID,
 		canReflink: canReflink,
 		blockfile:  blockfile,
+		blockLen:   blockLen,
 	}, nil
 }
 
@@ -69,6 +77,7 @@ func (s *nullChunkSeed) LongestMatchWith(chunks []IndexChunk) (int, SeedSegment)
 		from:       chunks[0].Start,
 		to:         chunks[n-1].Start + chunks[n-1].Size,
 		blockfile:  s.blockfile,
+		blockLen:   s.blockLen,
 		canReflink: s.canReflink,
 	}
 }
@@ -89,6 +98,7 @@ func (s *nullChunkSeed) IsInvalid() bool {
 type nullChunkSection struct {
 	from, to   uint64
 	blockfile  *os.File
+	blockLen   uint64 // Length of the blockfile, a multiple of the blocksize
 	canReflink bool
 }
 
@@ -108,16 +118,16 @@ func (s *nullChunkSection) WriteInto(dst *os.File, offset, length, blocksize uin
 		return 0, 0, fmt.Errorf("unable to copy %d bytes to %s : wrong size", length, dst.Name())
 	}
 
-	// When cloning isn't available we'd normally have to copy the 0 bytes into
-	// the target range. But if that's already blank (because it's a new/truncated
-	// file) there's no need to copy 0 bytes.
+	// A blank target, a new or truncated file, reads as zeros already. Cloning
+	// or copying zeros into it would only fill in what's a hole now, block by
+	// block when cloning.
+	if isBlank {
+		return 0, 0, nil
+	}
 	if !s.canReflink {
-		if isBlank {
-			return 0, 0, nil
-		}
 		return s.copy(dst, offset, s.Size())
 	}
-	return s.clone(dst, offset, length, blocksize, isBlank)
+	return s.clone(dst, offset, length, blocksize)
 }
 
 func (s *nullChunkSection) copy(dst *os.File, offset, length uint64) (uint64, uint64, error) {
@@ -130,18 +140,14 @@ func (s *nullChunkSection) copy(dst *os.File, offset, length uint64) (uint64, ui
 	return uint64(copied), 0, err
 }
 
-func (s *nullChunkSection) clone(dst *os.File, offset, length, blocksize uint64, isBlank bool) (uint64, uint64, error) {
+func (s *nullChunkSection) clone(dst *os.File, offset, length, blocksize uint64) (uint64, uint64, error) {
 	dstAlignStart := (offset/blocksize + 1) * blocksize
 	dstAlignEnd := (offset + length) / blocksize * blocksize
 
 	// If the range is too small to contain a full aligned block, there is
 	// nothing that can be cloned, and the copies below would write outside
-	// the range. Write zeros over the whole range instead, or nothing if
-	// it's still blank.
+	// the range. Write zeros over the whole range instead.
 	if dstAlignEnd <= dstAlignStart {
-		if isBlank {
-			return 0, 0, nil
-		}
 		return s.copy(dst, offset, length)
 	}
 
@@ -159,19 +165,17 @@ func (s *nullChunkSection) clone(dst *os.File, offset, length, blocksize uint64,
 	}
 	copied += c2
 
-	for blkOffset := dstAlignStart; blkOffset < dstAlignEnd; blkOffset += blocksize {
-		if err := cloneRange(dst, s.blockfile, 0, blocksize, blkOffset); err != nil {
+	for blkOffset := dstAlignStart; blkOffset < dstAlignEnd; {
+		n := min(s.blockLen, dstAlignEnd-blkOffset)
+		if err := cloneRange(dst, s.blockfile, 0, n, blkOffset); err != nil {
 			// Not every filesystem that passes the CanClone probe can clone
 			// every range. ZFS for example refuses to clone from the blockfile
-			// before it has been committed to disk. Fall back to writing zeros,
-			// or to doing nothing if the target range is still blank.
-			if isBlank {
-				return copied, cloned, nil
-			}
+			// before it has been committed to disk. Fall back to writing zeros.
 			c3, _, err := s.copy(dst, blkOffset, dstAlignEnd-blkOffset)
 			return copied + c3, cloned, err
 		}
-		cloned += blocksize
+		cloned += n
+		blkOffset += n
 	}
 	return copied, cloned, nil
 }
